@@ -1,0 +1,11 @@
+# Goal
+string goal_text      # 满足 info 约束的、向大模型说明后的输入文本
+string target_name    # 目标输出名称（由调用者指定）
+---
+# Result
+bool success
+string final_result   # 最终结果文本
+string error_msg
+---
+# Feedback
+string partial_result # 过程更新文本

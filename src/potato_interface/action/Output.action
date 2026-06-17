@@ -1,0 +1,10 @@
+# Goal
+string goal_text      # 满足 help 约束的输入文本
+---
+# Result
+bool success
+string final_result   # 最终结果文本
+string error_msg
+---
+# Feedback
+string partial_result # 过程更新文本

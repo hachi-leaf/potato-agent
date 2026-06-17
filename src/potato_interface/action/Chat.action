@@ -1,0 +1,18 @@
+# Goal
+ChatMessage[] messages
+bool stream
+string reasoning_effort
+int32 timeout_sec
+---
+# Result
+string reasoning_content
+string content
+int32 prompt_tokens
+int32 completion_tokens
+int32 total_tokens
+bool success
+string error_msg
+---
+# Feedback
+string partial_content
+string partial_reasoning
