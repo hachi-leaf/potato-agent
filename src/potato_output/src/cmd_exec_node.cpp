@@ -32,10 +32,8 @@ public:
       rclcpp::QoS(1).transient_local());
     auto help_msg = std_msgs::msg::String();
     help_msg.data =
-      "TYPE:action\n"
-      "Command Executor\n"
-      "输入 shell 命令，将执行并返回 stdout/stderr。\n"
-      "示例: goal_text = \"ls -l\"\n";
+      "参数为纯文本，参数会被直接当作 shell 命令执行，输出为命令的 stdout 和 stderr。\n"
+      "无法多行执行，所有输入均会被处理为单行命令。\n";
     help_pub_->publish(help_msg);
 
     // 创建 Action 服务器
@@ -53,7 +51,6 @@ private:
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr help_pub_;
   rclcpp_action::Server<Output>::SharedPtr action_server_;
 
-  // 简单存储正在执行的 Goal 的取消标志，但此处为并发设计，我们使用每个 Goal 独立的标志
   struct ActiveGoal {
     std::shared_ptr<GoalHandleOutput> handle;
     std::atomic<bool> cancel_flag{false};
@@ -61,7 +58,6 @@ private:
   std::mutex goals_mutex_;
   std::unordered_map<std::shared_ptr<GoalHandleOutput>, std::shared_ptr<ActiveGoal>> active_goals_;
 
-  // Goal 回调
   rclcpp_action::GoalResponse handle_goal(
       const rclcpp_action::GoalUUID&,
       std::shared_ptr<const Output::Goal> goal) {
@@ -88,7 +84,6 @@ private:
       std::lock_guard lock(goals_mutex_);
       active_goals_[goal_handle] = active;
     }
-    // 启动执行线程
     std::thread{std::bind(&CmdExecNode::execute, this, goal_handle, active)}.detach();
   }
 
@@ -111,11 +106,8 @@ private:
       return;
     }
 
-    // 逐行读取，发布反馈，同时检查取消
     while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-      // 检查取消
       if (active->cancel_flag.load()) {
-        // 尝试终止子进程（pclose 会等待结束，但我们可以直接关闭管道，非标准但可行）
         pclose(pipe);
         result->success = false;
         result->error_msg = "Cancelled";
@@ -125,8 +117,6 @@ private:
       }
       std::string line(buffer.data());
       full_output += line;
-
-      // 发布反馈（可选）
       auto feedback = std::make_shared<Output::Feedback>();
       feedback->partial_result = line;
       goal_handle->publish_feedback(feedback);

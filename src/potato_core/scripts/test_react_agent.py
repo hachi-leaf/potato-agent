@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-ReAct Agent —— 自动发现 output 工具，支持流式推理
+ReAct Agent —— 自定义标签协议，支持转义，优化流式显示
 """
+import re
 import sys
 import threading
 import rclpy
@@ -13,7 +14,6 @@ from potato_interface.msg import ChatMessage, ContentPart
 from potato_interface.srv import ListOutputs, GetOutputInfo
 
 
-# ==================== 工具函数 ====================
 def make_msg(role, text):
     msg = ChatMessage(role=role)
     part = ContentPart(type="text", text=text)
@@ -21,47 +21,46 @@ def make_msg(role, text):
     return msg
 
 
-# ==================== Agent 节点 ====================
 class ReactAgent(Node):
     def __init__(self, agent_name):
         super().__init__('react_agent')
         self.agent_name = agent_name
 
-        # 创建客户端
+        # 客户端
         self.chat_client = ActionClient(self, Chat, f'/{agent_name}/core/chat')
         self.call_client = ActionClient(self, CallOutput, f'/{agent_name}/output/call')
         self.list_client = self.create_client(ListOutputs, f'/{agent_name}/output/info/list')
         self.info_client = self.create_client(GetOutputInfo, f'/{agent_name}/output/info/get')
 
-        # 等待服务
         self.chat_client.wait_for_server(timeout_sec=10.0)
         self.call_client.wait_for_server(timeout_sec=10.0)
         self.list_client.wait_for_service(timeout_sec=5.0)
         self.info_client.wait_for_service(timeout_sec=5.0)
 
-        # 系统提示词（不包含具体工具列表）
+        # 动态构建系统提示词（含转义说明）
         self.system_prompt = (
-            "你是一个能够执行命令和操作的助手。你可以通过以下方式与系统交互：\n\n"
-            "1. 查询可用工具：\n"
-            "   动作：info list\n"
-            "   （系统会返回所有可用工具的名称列表）\n\n"
-            "2. 查看某个工具的详细用法：\n"
-            "   动作：info get <工具名>\n"
-            "   （系统会返回该工具的帮助文档）\n\n"
-            "3. 执行工具：\n"
-            "   动作：<工具名> <参数>\n"
-            "   （系统会执行工具并返回结果）\n\n"
-            "如果你已经能够回答用户的问题，请输出：\n"
-            "   最终答案：<你的回答>\n\n"
-            "注意：每次只输出一个动作或最终答案。请先使用 info 命令了解有哪些工具可用。"
+            f"你的名字是 {agent_name}，是一个 Agent。\n"
+            f"如果需要与系统交互，请在回复中包含特殊标签：\n"
+            f"开始标签：@^{agent_name}:命令名^@\n"
+            f"结束标签：@#{agent_name}:命令名#@\n"
+            f"命令内容放在两个标签之间。例如：\n"
+            f"  @^{agent_name}:tools_list^@None@#{agent_name}:tools_list#@\n"
+            f"  @^{agent_name}:tools_info^@工具名@#{agent_name}:tools_info#@\n"
+            f"  @^{agent_name}:工具名^@参数@#{agent_name}:工具名#@\n"
+            f"注意：每次只能使用一个工具。\n"
+            f"当你想要结束本轮 ReAct 时，请使用：\n"
+            f"  @^{agent_name}:end^@最终回答内容@#{agent_name}:end#@\n"
+            f"当你想在输出内容包括 @^,^@,@#,#@ 时，再加个@来转义，变成：\n"
+            f"  @@^,@^@,@@#,@#@\n"
         )
 
-        # 对话历史
         self.messages = [make_msg("system", self.system_prompt)]
 
-    # ==================== 工具发现（不经过 LLM） ====================
+        # 流式显示状态
+        self.last_fb_type = None      # 'reasoning' 或 'content'
+
+    # ================== 工具发现 ==================
     def list_tools(self):
-        """返回工具名称列表"""
         req = ListOutputs.Request()
         future = self.list_client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
@@ -73,7 +72,6 @@ class ReactAgent(Node):
         return list(res.names)
 
     def get_tool_info(self, name):
-        """返回指定工具的帮助文本"""
         req = GetOutputInfo.Request()
         req.name = name
         future = self.info_client.call_async(req)
@@ -85,18 +83,34 @@ class ReactAgent(Node):
             return "(获取工具信息失败)"
         return res.info
 
-    # ==================== LLM 流式推理 ====================
+    # ================== 流式推理（优化显示） ==================
     def feedback_cb(self, fb_msg):
-        """实时打印增量内容（包括推理和回答）"""
         fb = fb_msg.feedback
+
+        # 处理推理内容
         if fb.partial_reasoning:
+            if self.last_fb_type != 'reasoning':
+                if self.last_fb_type is not None:
+                    sys.stdout.write('\n')
+                sys.stdout.write('[思考] ')
+                self.last_fb_type = 'reasoning'
             sys.stdout.write(fb.partial_reasoning)
             sys.stdout.flush()
+
+        # 处理正式输出内容
         if fb.partial_content:
+            if self.last_fb_type != 'content':
+                if self.last_fb_type is not None:
+                    sys.stdout.write('\n')
+                sys.stdout.write('[回复] ')
+                self.last_fb_type = 'content'
             sys.stdout.write(fb.partial_content)
             sys.stdout.flush()
 
     def think_stream(self, messages):
+        # 重置流式状态
+        self.last_fb_type = None
+
         goal = Chat.Goal()
         goal.stream = True
         goal.reasoning_effort = "high"
@@ -126,12 +140,13 @@ class ReactAgent(Node):
             return None
         return res.content
 
-    # ==================== 工具执行 ====================
+    # ================== 工具执行 ==================
     def execute_tool(self, tool_name, args):
         goal = CallOutput.Goal()
         goal.target_name = tool_name
         goal.goal_text = args
 
+        print(f"[命令] {tool_name} {args}")
         future = self.call_client.send_goal_async(goal)
         rclpy.spin_until_future_complete(self, future, timeout_sec=30.0)
         if not future.done():
@@ -150,70 +165,56 @@ class ReactAgent(Node):
         else:
             return f"工具执行失败: {res.error_msg}"
 
-    # ==================== 主循环 ====================
+    # ================== 解析与循环 ==================
     def run(self, question):
         self.messages.append(make_msg("user", question))
 
         for step in range(999):
-            print(f"\n--- 第 {step+1} 轮 ---")
+            print(f"\n===== 第 {step+1} 轮 =====")
             reply = self.think_stream(self.messages)
             if reply is None:
                 return "错误：模型无响应"
             print()  # 换行
 
-            # 解析最终答案
-            final = None
-            for line in reply.split("\n"):
-                if "最终答案" in line:
-                    if "：" in line:
-                        final = line.split("：", 1)[-1].strip()
-                    elif ":" in line:
-                        final = line.split(":", 1)[-1].strip()
-            if final:
-                self.messages.append(make_msg("assistant", reply))
-                return final
+            # 1. 还原转义字符，避免干扰标签识别
+            reply_unescaped = reply.replace('@@^', '@^').replace('@^@', '^@').replace('@@#', '@#').replace('@#@', '#@')
 
-            # 解析动作
-            action_line = None
-            for line in reply.split("\n"):
-                line = line.strip()
-                if line.startswith("动作：") or line.startswith("Action:"):
-                    action_line = line
-                    break
-            if action_line is None:
+            # 2. 匹配标签：@^{agent}:命令^@ 内容 @#{agent}:命令#@
+            pattern = rf'@\^{self.agent_name}:(?P<cmd>[^^]+)\^@\s*(?P<content>.*?)\s*@#{self.agent_name}:(?P=cmd)#@'
+            matches = list(re.finditer(pattern, reply_unescaped, re.DOTALL))
+
+            if not matches:
+                print("[系统] 模型回复格式错误，请使用规定的标签格式。")
+                # 将原始回复（未转义）存入历史，以便模型看到自己写的转义字符
                 self.messages.append(make_msg("assistant", reply))
-                self.messages.append(make_msg("user", "请给出动作或最终答案。"))
+                self.messages.append(make_msg("user",
+                    f"你的回复格式不正确。请使用 @^{self.agent_name}:命令^@ 内容 @#{self.agent_name}:命令#@ 的格式。"))
                 continue
 
-            # 提取动作内容
-            if "：" in action_line:
-                action_str = action_line.split("：", 1)[-1].strip()
-            elif ":" in action_line:
-                action_str = action_line.split(":", 1)[-1].strip()
-            else:
-                action_str = ""
-            parts = action_str.split(maxsplit=1)
-            tool_name = parts[0] if parts else ""
-            args = parts[1] if len(parts) > 1 else ""
+            first_match = matches[0]
+            cmd = first_match.group("cmd").strip()
+            content = first_match.group("content").strip()
 
-            # 特殊处理 info 命令
-            if tool_name == "info":
-                if args == "list" or args.startswith("list"):
-                    tool_list = self.list_tools()
-                    obs = "可用工具列表：\n" + "\n".join(tool_list)
-                elif args.startswith("get "):
-                    target = args[4:].strip()
-                    obs = self.get_tool_info(target)
-                else:
-                    obs = "info 命令格式错误。请使用：info list 或 info get <工具名>"
-            else:
-                print(f"[执行] {tool_name} {args}")
-                obs = self.execute_tool(tool_name, args)
-                print(f"[结果] {obs}")
+            if cmd == "end":
+                self.messages.append(make_msg("assistant", reply))
+                return content if content else "对话结束"
 
-            # 追加历史
+            elif cmd == "tools_list":
+                tools = self.list_tools()
+                obs = "可用工具列表：\n" + "\n".join(tools)
+                print(f"[系统] 获取工具列表")
+
+            elif cmd == "tools_info":
+                tool_name = content
+                obs = self.get_tool_info(tool_name)
+                print(f"[系统] 查询工具 '{tool_name}' 的信息")
+
+            else:
+                obs = self.execute_tool(cmd, content)
+
+            print(f"[结果] {obs}")
             self.messages.append(make_msg("assistant", reply))
-            self.messages.append(make_msg("user", f"观察结果：\n{obs}"))
+            self.messages.append(make_msg("user", f"系统返回：\n{obs}"))
 
         return "超过最大步数，任务中止。"
 

@@ -27,20 +27,16 @@ public:
     std::string agent_name = get_parameter("agent_name").as_string();
     std::string func_name = "file_view";
 
-    // 发布 help 话题
     help_pub_ = create_publisher<std_msgs::msg::String>(
       "/" + agent_name + "/output/" + func_name + "/help",
       rclcpp::QoS(1).transient_local());
     auto help_msg = std_msgs::msg::String();
     help_msg.data =
-      "TYPE:action\n"
-      "File Viewer - 查看文件内容\n"
-      "输入格式: <范围类型> [参数...] <文件路径>\n"
-      "范围类型:\n"
-      "  all      : 显示整个文件\n"
-      "  head N   : 显示文件前 N 行\n"
-      "  tail N   : 显示文件最后 N 行\n"
-      "  range A B: 显示第 A 行到第 B 行\n"
+      "参数为纯文本，格式为：\n"
+      "<mode> <lineno>  <filepath>\n"
+      "mode: all (显示整个文件), head (显示前几行), tail (显示最后几行), range (显示指定范围)\n"
+      "lineno: 行号\n"
+      "filepath: 文件路径\n"
       "示例:\n"
       "  all /etc/passwd\n"
       "  head 10 /var/log/syslog\n"
@@ -48,7 +44,6 @@ public:
       "  range 5 10 /etc/passwd\n";
     help_pub_->publish(help_msg);
 
-    // 创建 Action 服务器
     action_server_ = rclcpp_action::create_server<Output>(
       this,
       "/" + agent_name + "/output/" + func_name,
@@ -87,8 +82,7 @@ private:
     return rclcpp_action::CancelResponse::ACCEPT;
   }
 
-  void handle_accepted(
-      const std::shared_ptr<GoalHandleOutput> goal_handle) {
+  void handle_accepted(const std::shared_ptr<GoalHandleOutput> goal_handle) {
     auto active = std::make_shared<ActiveGoal>();
     active->handle = goal_handle;
     {
@@ -98,7 +92,6 @@ private:
     std::thread{std::bind(&FileViewNode::execute, this, goal_handle, active)}.detach();
   }
 
-  // 根据 goal_text 构建 shell 命令
   std::string build_cmd(const std::string& input) {
     std::istringstream iss(input);
     std::string type;
@@ -108,20 +101,17 @@ private:
       std::string filepath;
       if (!(iss >> filepath)) return "";
       return "cat \"" + filepath + "\" 2>&1";
-    }
-    else if (type == "head") {
+    } else if (type == "head") {
       int n;
       std::string filepath;
       if (!(iss >> n >> filepath)) return "";
       return "head -n " + std::to_string(n) + " \"" + filepath + "\" 2>&1";
-    }
-    else if (type == "tail") {
+    } else if (type == "tail") {
       int n;
       std::string filepath;
       if (!(iss >> n >> filepath)) return "";
       return "tail -n " + std::to_string(n) + " \"" + filepath + "\" 2>&1";
-    }
-    else if (type == "range") {
+    } else if (type == "range") {
       int a, b;
       std::string filepath;
       if (!(iss >> a >> b >> filepath)) return "";
@@ -130,9 +120,8 @@ private:
     return "";
   }
 
-  void execute(
-      std::shared_ptr<GoalHandleOutput> goal_handle,
-      std::shared_ptr<ActiveGoal> active) {
+  void execute(std::shared_ptr<GoalHandleOutput> goal_handle,
+               std::shared_ptr<ActiveGoal> active) {
     auto goal = goal_handle->get_goal();
     auto result = std::make_shared<Output::Result>();
 
@@ -183,8 +172,9 @@ private:
         result->final_result = output;
       } else {
         result->success = false;
-        result->final_result = output;
-        result->error_msg = "File view failed (check path or permissions)";
+        result->final_result = output;          // 输出原始错误信息
+        result->error_msg = output.empty() ?
+                            "File view failed" : output;  // 将错误文本传递给调用者
       }
       goal_handle->succeed(result);
     }
